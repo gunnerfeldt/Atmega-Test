@@ -1,0 +1,19 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"name": "Atmega Test",
+			"path": ".."
+		},
+		{
+			"name": "Wifi Gizmo 2.0 MQTT",
+			"path": "../../Wifi Gizmo 2.0 MQTT"
+		},
+		{
+			"path": "../../Wifi Gizmo 2.0 MQTT/Adafruit_MQTT_Library-master"
+		}
+	],
+	"settings": {}
+}
