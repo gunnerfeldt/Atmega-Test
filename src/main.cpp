@@ -21,6 +21,7 @@
 #define	RLY_MISC 0x23
 
 #define	DEBOUNCE 3 // 5-10 is abs max .. 3 should be fine
+#define	LONG_PRESS 50 //
 
 /////////////////////////////Global Vars////////////////////////////////////// 
 
@@ -28,10 +29,14 @@ signed char enc_states[] = {0,1,-1,0,-1,0,0,1,1,0,0,-1,0,-1,1,0};
 uint8_t BUTTON_LAT[] = {0, 4, 8, 13, 1, 5, 9, 15, 2, 6, 10, 14, 3, 7, 11, 12};
 uint8_t debounce_flag = 0;
 auto timer = timer_create_default(); // create a timer with default settings
-uint8_t pressedButton = 0; // byte for pressed button
-uint8_t holdButton = 0; // byte for hold button more than 3 sec
-uint8_t relayPending = 0; // bit field for relay to be updated
-uint8_t buttonPressFlag = 0; // flag containing button id
+uint16_t pressedButtonLED = 0;
+
+// uint8_t holdButton = 0; // byte for hold button more than 3 sec
+// uint8_t relayPending = 0; // bit field for relay to be updated
+// uint8_t buttonPressFlag = 0; // flag containing button id
+uint8_t blink = 0;
+uint8_t hold_state = 0;
+uint16_t LED_snapshot = 0;
 
 union MONIMOUR_STATES_UNION{
   uint32_t led_word;
@@ -48,18 +53,18 @@ union MONIMOUR_STATES_UNION{
     unsigned talkback:1;  // 1
     unsigned mutes:2; // 2
     unsigned solos:2; // 2
-    uint8_t input_trim[4]; // 32
-    uint8_t output_trim[4]; // 32
-    signed char dim_trim = 50;  // 8
+    signed char input_trim[4]; // 32 (-47 to 48)
+    signed char output_trim[4]; // 32 (-47 to 48)
+    unsigned char dim_trim = 50;  // 8 (percentage)
   };
 };
-
 
 union {
 	uint32_t word;
 	struct {
     uint16_t ring;
     union {
+      uint16_t buttons_word;
       struct {
         unsigned right_buttons:4;
         unsigned outputs:4;
@@ -89,19 +94,23 @@ union {
 	};
 } LEDs;
 
-union {
+#define HOLD_BUTTON_MASK 0b0000111111111100
+union BUTTONS_UNION{
 	uint16_t word;
   struct {
-    uint8_t mono:1;
-    uint8_t mute:1;
-    uint8_t dim:1;
-    uint8_t talkback:1;
-    uint8_t output:4;
-    uint8_t input:4;
-    uint8_t mutes:2;
-    uint8_t solos:2;
+    unsigned mono:1;
+    unsigned mute:1;
+    unsigned dim:1;
+    unsigned talkback:1;
+    unsigned output:4;
+    unsigned input:4;
+    unsigned mutes:2;
+    unsigned solos:2;
   };
 } BUTTONs;
+
+
+BUTTONS_UNION pressedButton;
 
 /*
   config state notes
@@ -128,7 +137,6 @@ void calcVolume(unsigned char);
 void calcLEDring(void);
 void setLEDs (void);
 void scanButtons(void);
-void buttonActions(void);
 void setRelays(uint8_t, uint8_t);
 void timerTick(void);
 unsigned char reverse(unsigned char);
@@ -173,6 +181,9 @@ void setup() {
   MONIMOUR_STATES.input = 1;
   MONIMOUR_STATES.output = 1;
 
+  // for now, set this in EEPROM later
+  MONIMOUR_STATES.dim_trim = 50;
+
   while (!Serial) { delay(10); }
 
   Serial.begin(9600);
@@ -190,7 +201,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(2), checkEnc, CHANGE);
   attachInterrupt(digitalPinToInterrupt(3), checkEnc, CHANGE);
 
-  timer.every(1000, timerTick);
+  timer.every(500, timerTick);
   
 }
 
@@ -201,16 +212,20 @@ void loop() {
   calibrateVolume();
   setLEDs();
   
+  //  when debounce is done
   if(debounce_flag){
     if(debounce_cnt == DEBOUNCE){
       if(BUTTONs.input){
         MONIMOUR_STATES.input = findPosition(BUTTONs.input);
+        pressedButton.word = BUTTONs.word;
       }
       if(BUTTONs.output){
         MONIMOUR_STATES.output = findPosition(BUTTONs.output);
+        pressedButton.word = BUTTONs.word;
       }
       if(BUTTONs.dim){
         MONIMOUR_STATES.dim = !MONIMOUR_STATES.dim;
+        pressedButton.word = BUTTONs.word;
       }
       if(BUTTONs.mute){
         MONIMOUR_STATES.mute = !MONIMOUR_STATES.mute;
@@ -220,7 +235,9 @@ void loop() {
       }
       if(BUTTONs.talkback){
         MONIMOUR_STATES.talkback = !MONIMOUR_STATES.talkback;
+        pressedButton.word = BUTTONs.word;
       }
+  //    hold_state = 0;
     }
     debounce_cnt--;
     if(debounce_cnt == 0) {
@@ -228,72 +245,65 @@ void loop() {
       debounce_flag = 0;
     }
   }
-  else scanButtons();
-
-  if(MONIMOUR_STATES.led_word != lastState.led_word){
-    if(MONIMOUR_STATES.input != lastState.input){
-      setRelays(RLY_INPUTS, 1 << (MONIMOUR_STATES.input - 1));
-      LEDs.inputs = 16 >> MONIMOUR_STATES.input;
-      Serial.print("INPUT SELECT: ");
-      Serial.println(MONIMOUR_STATES.input);
-    }
-    if(MONIMOUR_STATES.output != lastState.output){
-      setRelays(RLY_OUTPUTS, 1 << (MONIMOUR_STATES.output -1 ));
-      LEDs.outputs = 16 >> MONIMOUR_STATES.output;
-      Serial.print("OUTPUT SELECT: ");
-      Serial.println(MONIMOUR_STATES.output);
-    }
-    if(MONIMOUR_STATES.dim != lastState.dim){
-      LEDs.dim = MONIMOUR_STATES.dim;
-      Serial.print("DIM: ");
-      Serial.println(MONIMOUR_STATES.dim);
-    }
-    if(MONIMOUR_STATES.mute != lastState.mute){
-      LEDs.mute = MONIMOUR_STATES.mute;
-      setRelays(RLY_OUTPUTS, (1 << MONIMOUR_STATES.output -1) * !MONIMOUR_STATES.mute);
-      Serial.print("MUTE: ");
-      Serial.println(MONIMOUR_STATES.mute);
-    }
-    if(MONIMOUR_STATES.mono != lastState.mono){
-      LEDs.mono = MONIMOUR_STATES.mono;
-      miscRelay = (miscRelay & 0b11011111) + (0x20 * MONIMOUR_STATES.mono);
-      setRelays(RLY_MISC, miscRelay);
-      Serial.print("MONO: ");
-      Serial.println(MONIMOUR_STATES.mono);
-    }
-    if(MONIMOUR_STATES.talkback != lastState.talkback){
-      LEDs.talk_back = MONIMOUR_STATES.talkback;
-      miscRelay = (miscRelay & 0b11110111) + (0x04 * MONIMOUR_STATES.talkback);
-      setRelays(RLY_MISC, miscRelay);
-      Serial.print("TALK BACK: ");
-      Serial.println(MONIMOUR_STATES.talkback);
-    }
-    lastState.led_word = MONIMOUR_STATES.led_word;
+  // continue scan 
+  else {
+    scanButtons();
   }
 
-
-  if(pressedButton){
-  //  Serial.println(pressedButton);
-  }
-/*
-  // if button has been pressed - normal
-  if(buttonPressFlag){
-    // do button action
-    // if in operation state - update relays and leds
-    if(!holdButton){
+  if(hold_state){
+    if(pressedButton.dim == 1){
+      MONIMOUR_STATES.dim = 1;
     }
-    // if in config state - check if button is relevant
-    else{
-    }
-    buttonPressFlag = 0;
+    LEDs.buttons_word = 0;
+    LEDs.buttons_word = pressedButtonLED * blink;
   }
-*/
-  // if button has been pressed - timeout
-  // go into config state or leave it
-
-  
+  else{
+    if(MONIMOUR_STATES.led_word != lastState.led_word){
+      if(MONIMOUR_STATES.input != lastState.input){
+        setRelays(RLY_INPUTS, 1 << (MONIMOUR_STATES.input - 1));
+        LEDs.inputs = 16 >> MONIMOUR_STATES.input;
+        pressedButtonLED = LEDs.buttons_word & 0x0F00;
+        Serial.print("INPUT SELECT: ");
+        Serial.println(MONIMOUR_STATES.input);
+      }
+      if(MONIMOUR_STATES.output != lastState.output){
+        setRelays(RLY_OUTPUTS, 1 << (MONIMOUR_STATES.output -1 ));
+        LEDs.outputs = 16 >> MONIMOUR_STATES.output;
+        pressedButtonLED = LEDs.buttons_word & 0x00F0;
+        Serial.print("OUTPUT SELECT: ");
+        Serial.println(MONIMOUR_STATES.output);
+      }
+      if(MONIMOUR_STATES.dim != lastState.dim){
+        LEDs.dim = MONIMOUR_STATES.dim;
+        pressedButtonLED = 0x0002;
+        Serial.print("DIM: ");
+        Serial.println(MONIMOUR_STATES.dim);
+      }
+      if(MONIMOUR_STATES.mute != lastState.mute){
+        LEDs.mute = MONIMOUR_STATES.mute;
+        setRelays(RLY_OUTPUTS, (1 << MONIMOUR_STATES.output -1) * !MONIMOUR_STATES.mute);
+        Serial.print("MUTE: ");
+        Serial.println(MONIMOUR_STATES.mute);
+      }
+      if(MONIMOUR_STATES.mono != lastState.mono){
+        LEDs.mono = MONIMOUR_STATES.mono;
+        miscRelay = (miscRelay & 0b11011111) + (0x20 * MONIMOUR_STATES.mono);
+        setRelays(RLY_MISC, miscRelay);
+        Serial.print("MONO: ");
+        Serial.println(MONIMOUR_STATES.mono);
+      }
+      if(MONIMOUR_STATES.talkback != lastState.talkback){
+        LEDs.talk_back = MONIMOUR_STATES.talkback;
+        pressedButtonLED = 0x0001;
+        miscRelay = (miscRelay & 0b11110111) + (0x04 * MONIMOUR_STATES.talkback);
+        setRelays(RLY_MISC, miscRelay);
+        Serial.print("TALK BACK: ");
+        Serial.println(MONIMOUR_STATES.talkback);
+      }
+      lastState.led_word = MONIMOUR_STATES.led_word;
+    }
+  }
   delay(30);
-
   timer.tick(); // tick the timer
 }
 
@@ -356,7 +366,7 @@ void calibrateVolume(void){
       calVol = 63; 
   }  
   if(lastVolume != MONIMOUR_STATES.volume){
-    calcLEDring();
+  //  calcLEDring();
     lastVolume = MONIMOUR_STATES.volume;
   }  
   if(lastCalVolume != calVol){
@@ -382,6 +392,7 @@ void calcLEDring(void){
 void scanButtons(void){
   uint8_t col, row;
   uint16_t button_temp = 0;
+  static int longPressCnt = LONG_PRESS;
 
   digitalWrite(10, 1);
   digitalWrite(11, 1);
@@ -405,70 +416,31 @@ void scanButtons(void){
   }
 
   if(BUTTONs.word != button_temp){
-    /*
-      Serial.print("button = ");
-      if(button_temp){
-        Serial.print(button_temp);
-        Serial.println(" pressed!");
-      }
-      else{
-        Serial.print(BUTTONs.word);
-        Serial.println(" released!");
-      }
-    */
-      BUTTONs.word = button_temp;
+      longPressCnt = LONG_PRESS;
       debounce_flag = 1;
-  }
-
-
-  /*
-  // if one or more buttons is pressed AND no button is in hold mode
-  if(BUTTONs.word){
-    uint8_t i=16;
-    // count thru to find the pressed button
-    while (i){
-      if(BUTTONs.word & (0x1 << i)){
-        // store it as a id
-        pressedButton = i;
-        break;
+      BUTTONs.word = button_temp;
+      if(BUTTONs.word && hold_state) {
+        // clear hold state & cancel button press
+        BUTTONs.word = 0;
+        hold_state = 0;
+        LEDs.buttons_word = LED_snapshot;
+        Serial.println("STORE CONFIG");
+      }else{
       }
-      i--;
+  }
+  else if(BUTTONs.word & HOLD_BUTTON_MASK){
+    // count long press
+    if(longPressCnt){
+      longPressCnt--;
     }
-  }else if(pressedButton) {
-    holdButton = 0;
-    // this should be trigger
-    // store it also for release trig
-    buttonPressFlag = pressedButton;
-    pressedButton = 0;
+    else if((BUTTONs.word & HOLD_BUTTON_MASK) && !hold_state){
+      hold_state = 1;
+      LED_snapshot = LEDs.buttons_word;
+      Serial.print("ENTER CONFIG: ");
+      Serial.println(BUTTONs.word);
+    }
   }
-  */
 }
-
-void buttonActions(void){
-}
-
-/*
-void buttonActions(void){
-  // check input buttons
-  if(BUTTONs.input){
-    // set relays
-    RELAYs.inputs = BUTTONs.input * BUTTONs.input * 3;
-    // set leds
-  }
-  // check output buttons
-  if(BUTTONs.output){
-    // set relays
-    RELAYs.outputs = BUTTONs.output * BUTTONs.output * 3;
-    // set leds
-  }
-  // check mute buttons
-  // check solo buttons
-  // check mono buttons
-  // check mute button
-  // check dim buttons
-  // check talkback buttons
-}
-*/
 
 void setRelays(uint8_t addr, uint8_t data){
     Wire.beginTransmission(addr); // 0b0100000 + addr
@@ -478,26 +450,12 @@ void setRelays(uint8_t addr, uint8_t data){
 }
 
 void timerTick(void){
-  static uint8_t pressedButtonTimer = 0;
-
-  // if a button is pressed: start counting
-  if (pressedButton){
-    // break if button already in hold
-    if (!holdButton){
-      // start timer and count
-      if (!pressedButtonTimer) pressedButtonTimer = 12;
-      else pressedButtonTimer--;
-      // if timeout: store hold button
-      if(!pressedButtonTimer){
-        holdButton = pressedButton;
-        // store it also for release trig
-        pressedButton = 0;
-      }
-    }
-  } 
-  else pressedButtonTimer = 0;
+  if(blink) blink = 0;
+  else blink = 1;
+//  blink = !blink;
+//  Serial.print("Blink: ");
+//  Serial.println(blink);
 }
-
 unsigned char reverse(unsigned char b) {
    b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
    b = (b & 0xCC) >> 2 | (b & 0x33) << 2;
