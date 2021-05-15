@@ -30,6 +30,7 @@ uint8_t BUTTON_LAT[] = {0, 4, 8, 13, 1, 5, 9, 15, 2, 6, 10, 14, 3, 7, 11, 12};
 uint8_t debounce_flag = 0;
 auto timer = timer_create_default(); // create a timer with default settings
 uint16_t pressedButtonLED = 0;
+signed char POT_LEVEL = 1; 
 
 // uint8_t holdButton = 0; // byte for hold button more than 3 sec
 // uint8_t relayPending = 0; // bit field for relay to be updated
@@ -39,10 +40,12 @@ uint8_t hold_state = 0;
 uint16_t LED_snapshot = 0;
 
 union MONIMOUR_STATES_UNION{
-  uint32_t led_word;
-  uint32_t input_trim_word;
-  uint32_t output_trim_word;
-  uint8_t dim_trim_byte;
+  struct {
+    uint32_t led_word;
+    uint32_t input_trim_word;
+    uint32_t output_trim_word;
+    uint8_t dim_trim_byte;
+  };
   struct {
     uint8_t input; // 8
     uint8_t output; // 8
@@ -53,9 +56,9 @@ union MONIMOUR_STATES_UNION{
     unsigned talkback:1;  // 1
     unsigned mutes:2; // 2
     unsigned solos:2; // 2
-    signed char input_trim[4]; // 32 (-47 to 48)
-    signed char output_trim[4]; // 32 (-47 to 48)
-    unsigned char dim_trim = 50;  // 8 (percentage)
+    uint8_t input_trim[4]; // 32 (-8 to 8)
+    uint8_t output_trim[4]; // 32 (-8 to 8)
+    uint8_t dim_trim = 16;  // 8 (percentage)
   };
 };
 
@@ -175,14 +178,19 @@ void setup() {
   pinMode(11, OUTPUT);
   pinMode(12, OUTPUT);
   pinMode(13, OUTPUT);
+
+  EEPROM.get(0, MONIMOUR_STATES);
   
+  MONIMOUR_STATES.mono = 0;
+  MONIMOUR_STATES.mute = 0;
   MONIMOUR_STATES.dim = 0;
-  MONIMOUR_STATES.volume = 1;
+  MONIMOUR_STATES.talkback = 0;
   MONIMOUR_STATES.input = 1;
   MONIMOUR_STATES.output = 1;
+  MONIMOUR_STATES.volume = 1;
 
   // for now, set this in EEPROM later
-  MONIMOUR_STATES.dim_trim = 50;
+  // MONIMOUR_STATES.dim_trim = 32;
 
   while (!Serial) { delay(10); }
 
@@ -209,6 +217,7 @@ void loop() {
   static unsigned char n = 1;
   static uint16_t debounce_cnt = DEBOUNCE;
 
+  calcLEDring();
   calibrateVolume();
   setLEDs();
   
@@ -253,23 +262,36 @@ void loop() {
   if(hold_state){
     if(pressedButton.dim == 1){
       MONIMOUR_STATES.dim = 1;
+      MONIMOUR_STATES.dim_trim = POT_LEVEL;
     }
+    if(pressedButton.input) {
+      MONIMOUR_STATES.input_trim[MONIMOUR_STATES.input - 1] = POT_LEVEL;
+      pressedButtonLED = 0x0800 >> (MONIMOUR_STATES.input - 1);
+    }
+    if(pressedButton.output) {
+      MONIMOUR_STATES.output_trim[MONIMOUR_STATES.output - 1] = POT_LEVEL;
+      pressedButtonLED = 0x0080 >> (MONIMOUR_STATES.output - 1);
+    }
+    
     LEDs.buttons_word = 0;
     LEDs.buttons_word = pressedButtonLED * blink;
   }
   else{
+
+    MONIMOUR_STATES.volume = POT_LEVEL;
+
     if(MONIMOUR_STATES.led_word != lastState.led_word){
       if(MONIMOUR_STATES.input != lastState.input){
         setRelays(RLY_INPUTS, 1 << (MONIMOUR_STATES.input - 1));
         LEDs.inputs = 16 >> MONIMOUR_STATES.input;
-        pressedButtonLED = LEDs.buttons_word & 0x0F00;
+    //    pressedButtonLED = LEDs.buttons_word & 0x0F00;
         Serial.print("INPUT SELECT: ");
         Serial.println(MONIMOUR_STATES.input);
       }
       if(MONIMOUR_STATES.output != lastState.output){
-        setRelays(RLY_OUTPUTS, 1 << (MONIMOUR_STATES.output -1 ));
+        setRelays(RLY_OUTPUTS, 1 << (MONIMOUR_STATES.output - 1 ));
         LEDs.outputs = 16 >> MONIMOUR_STATES.output;
-        pressedButtonLED = LEDs.buttons_word & 0x00F0;
+    //    pressedButtonLED = LEDs.buttons_word & 0x00F0;
         Serial.print("OUTPUT SELECT: ");
         Serial.println(MONIMOUR_STATES.output);
       }
@@ -329,14 +351,26 @@ void setLEDs (void)
 void checkEnc(void){ 
   cli(); //stop interrupts happening before we read pin values
   unsigned char encState = (ENCB << 1) + ENCA;
-//  unsigned char encState = PIND & 0x3;
-  calcVolume(encState);
+  static signed char enc_position = 0;
+  enc_position <<= 2;
+  enc_position |= (encState);
+  POT_LEVEL += enc_states[( enc_position & 0x0f )];
+  if( POT_LEVEL < 0 ){ 
+      POT_LEVEL = 0; 
+  }
+  if( POT_LEVEL > 63 ){ 
+      POT_LEVEL = 63; 
+  }    
+
+//  calcVolume(encState);
+/*
   if( MONIMOUR_STATES.volume < 0 ){ 
       MONIMOUR_STATES.volume = 0; 
   }
   if( MONIMOUR_STATES.volume > 63 ){ 
       MONIMOUR_STATES.volume = 63; 
   }    
+*/
   sei(); //restart interrupts
 }
 
@@ -353,11 +387,17 @@ void calibrateVolume(void){
   unsigned int calVol;
 
   if(MONIMOUR_STATES.dim){
-    calVol = (MONIMOUR_STATES.volume * MONIMOUR_STATES.dim_trim) / 100;
+    unsigned temp = (MONIMOUR_STATES.dim_trim * 158) / 100;
+    calVol = (MONIMOUR_STATES.volume * temp) / 100;
   }
   else {
     calVol = MONIMOUR_STATES.volume;
   }
+  // calibrate with in & out trims here
+  signed char deltaVol = MONIMOUR_STATES.input_trim[MONIMOUR_STATES.input-1] - 32; 
+  deltaVol += MONIMOUR_STATES.output_trim[MONIMOUR_STATES.output-1] - 32; 
+  calVol = calVol + deltaVol;
+
   
   if( calVol < 0 ){ 
       calVol = 0; 
@@ -370,7 +410,7 @@ void calibrateVolume(void){
     lastVolume = MONIMOUR_STATES.volume;
   }  
   if(lastCalVolume != calVol){
-    calcLEDring();
+  //  calcLEDring();
     lastCalVolume = calVol;
     uint8_t vol_shift = reverse(calVol);
     setRelays(RLY_ATTENUATOR, vol_shift);
@@ -381,7 +421,8 @@ void calcLEDring(void){
     int pot;
 	  float rem;
 	  unsigned char ledNo;
-  	pot = MONIMOUR_STATES.volume - 2;
+//  	pot = MONIMOUR_STATES.volume - 2;
+  	pot = POT_LEVEL - 2;
     LEDs.ring = 1;
 		rem = pot % 4;
 		if (rem >1) LEDs.ring += 2;
@@ -416,17 +457,19 @@ void scanButtons(void){
   }
 
   if(BUTTONs.word != button_temp){
-      longPressCnt = LONG_PRESS;
-      debounce_flag = 1;
-      BUTTONs.word = button_temp;
-      if(BUTTONs.word && hold_state) {
-        // clear hold state & cancel button press
-        BUTTONs.word = 0;
-        hold_state = 0;
-        LEDs.buttons_word = LED_snapshot;
-        Serial.println("STORE CONFIG");
-      }else{
-      }
+    longPressCnt = LONG_PRESS;
+    debounce_flag = 1;
+    BUTTONs.word = button_temp;
+    if(BUTTONs.word && hold_state) {
+      // clear hold state & cancel button press
+      BUTTONs.word = 0;
+      hold_state = 0;
+      POT_LEVEL = MONIMOUR_STATES.volume;
+      pressedButton.word = 0;
+      LEDs.buttons_word = LED_snapshot;
+      EEPROM.put(0, MONIMOUR_STATES);
+      Serial.println("STORE CONFIG");
+    }
   }
   else if(BUTTONs.word & HOLD_BUTTON_MASK){
     // count long press
@@ -436,6 +479,15 @@ void scanButtons(void){
     else if((BUTTONs.word & HOLD_BUTTON_MASK) && !hold_state){
       hold_state = 1;
       LED_snapshot = LEDs.buttons_word;
+      if(BUTTONs.dim) POT_LEVEL = MONIMOUR_STATES.dim_trim;
+      if(BUTTONs.input == 1) POT_LEVEL = MONIMOUR_STATES.input_trim[0];
+      if(BUTTONs.input == 2) POT_LEVEL = MONIMOUR_STATES.input_trim[1];
+      if(BUTTONs.input == 4) POT_LEVEL = MONIMOUR_STATES.input_trim[2];
+      if(BUTTONs.input == 8) POT_LEVEL = MONIMOUR_STATES.input_trim[3];
+      if(BUTTONs.output == 1) POT_LEVEL = MONIMOUR_STATES.output_trim[0];
+      if(BUTTONs.output == 2) POT_LEVEL = MONIMOUR_STATES.output_trim[1];
+      if(BUTTONs.output == 4) POT_LEVEL = MONIMOUR_STATES.output_trim[2];
+      if(BUTTONs.output == 8) POT_LEVEL = MONIMOUR_STATES.output_trim[3];
       Serial.print("ENTER CONFIG: ");
       Serial.println(BUTTONs.word);
     }
